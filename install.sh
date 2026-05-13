@@ -1,7 +1,6 @@
 #!/bin/bash
 # TG Mirror 一键安装 & 管理脚本
 # 安装: bash <(curl -sL https://raw.githubusercontent.com/agjvrkgj/tg-mirror/main/install.sh)
-# 管理: tg-mirror
 
 set -e
 
@@ -15,6 +14,7 @@ SELF_URL="https://raw.githubusercontent.com/agjvrkgj/tg-mirror/main/install.sh"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 info() { echo -e "${GREEN}[✓]${NC} $1"; }
@@ -46,7 +46,6 @@ json.dump(cfg, open('$CONFIG_FILE','w'), indent=2, ensure_ascii=False)
 }
 
 resolve_channel() {
-    # 解析频道 username 为 ID
     local username=$1
     python3 -c "
 from telethon.sync import TelegramClient
@@ -118,7 +117,6 @@ json.dump(cfg, open('$CONFIG_FILE','w'), indent=2, ensure_ascii=False)
 }
 
 generate_mirror_script() {
-    # 根据配置生成搬运脚本
     python3 -c "
 import json
 
@@ -289,7 +287,7 @@ EOF
     systemctl daemon-reload
 }
 
-# ===== 安装流程 =====
+# ===== 功能函数 =====
 
 do_install() {
     echo ""
@@ -355,24 +353,37 @@ client.disconnect()
     chmod +x /usr/local/bin/tg-mirror
 
     echo ""
-    echo "========================"
-    info "安装完成！"
-    echo ""
-    echo "  管理命令: tg-mirror"
-    echo "  查看状态: tg-mirror status"
-    echo "  添加源频道: tg-mirror add <username>"
-    echo "  删除源频道: tg-mirror del <username>"
-    echo "  修改目标: tg-mirror target <username>"
-    echo "  重启服务: tg-mirror restart"
-    echo "  停止服务: tg-mirror stop"
-    echo "  启动服务: tg-mirror start"
-    echo "  查看日志: tg-mirror log"
-    echo "  更新版本: tg-mirror update"
-    echo "  卸载: tg-mirror uninstall"
+    info "安装完成！使用 tg-mirror 进入管理菜单"
     echo ""
 }
 
-# ===== 管理命令 =====
+do_update() {
+    info "更新 TG Mirror..."
+    curl -sL "$SELF_URL" -o /usr/local/bin/tg-mirror
+    chmod +x /usr/local/bin/tg-mirror
+    generate_mirror_script
+    systemctl restart $SERVICE_NAME
+    info "更新完成，服务已重启"
+}
+
+do_uninstall() {
+    echo ""
+    warn "即将卸载 TG Mirror，这将删除所有配置和数据"
+    read -p "确认卸载？(y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        info "已取消"
+        return
+    fi
+
+    systemctl stop $SERVICE_NAME 2>/dev/null || true
+    systemctl disable $SERVICE_NAME 2>/dev/null || true
+    rm -f /etc/systemd/system/$SERVICE_NAME.service
+    systemctl daemon-reload
+    rm -rf $INSTALL_DIR
+    rm -f /usr/local/bin/tg-mirror
+
+    info "卸载完成"
+}
 
 do_status() {
     echo ""
@@ -388,10 +399,9 @@ do_status() {
 }
 
 do_add() {
-    local username=$1
-    if [ -z "$username" ]; then
-        read -p "请输入源频道 username: " username
-    fi
+    echo ""
+    read -p "请输入源频道 username（不带 @）: " username
+    [ -z "$username" ] && return
     username=${username#@}
     result=$(add_source "$username")
     if [ "$result" = "OK" ]; then
@@ -405,10 +415,13 @@ do_add() {
 }
 
 do_del() {
-    local username=$1
-    if [ -z "$username" ]; then
-        read -p "请输入要删除的源频道 username: " username
-    fi
+    echo ""
+    load_config
+    echo "当前源频道:"
+    echo "$SOURCES"
+    echo ""
+    read -p "请输入要删除的源频道 username（不带 @）: " username
+    [ -z "$username" ] && return
     username=${username#@}
     result=$(del_source "$username")
     if [ "$result" = "OK" ]; then
@@ -422,10 +435,9 @@ do_del() {
 }
 
 do_target() {
-    local username=$1
-    if [ -z "$username" ]; then
-        read -p "请输入目标频道 username: " username
-    fi
+    echo ""
+    read -p "请输入新的目标频道 username（不带 @）: " username
+    [ -z "$username" ] && return
     username=${username#@}
     set_target "$username"
     generate_mirror_script
@@ -433,100 +445,176 @@ do_target() {
     info "服务已重启"
 }
 
+do_service() {
+    echo ""
+    status=$(systemctl is-active $SERVICE_NAME 2>/dev/null || echo "stopped")
+    echo "  当前状态: $status"
+    echo ""
+    echo "  1) 启动"
+    echo "  2) 停止"
+    echo "  3) 重启"
+    echo "  0) 返回"
+    echo ""
+    read -p "请选择: " choice
+    case "$choice" in
+        1) systemctl start $SERVICE_NAME; info "服务已启动" ;;
+        2) systemctl stop $SERVICE_NAME; info "服务已停止" ;;
+        3) systemctl restart $SERVICE_NAME; info "服务已重启" ;;
+        *) return ;;
+    esac
+}
+
 do_log() {
     journalctl -u $SERVICE_NAME -f
 }
 
-do_update() {
-    info "更新 TG Mirror..."
-    # 下载最新管理脚本
-    curl -sL "$SELF_URL" -o /usr/local/bin/tg-mirror
-    chmod +x /usr/local/bin/tg-mirror
-    # 重新生成搬运脚本
-    generate_mirror_script
-    systemctl restart $SERVICE_NAME
-    info "更新完成，服务已重启"
-}
+# ===== 交互菜单 =====
 
-do_uninstall() {
+show_menu() {
+    clear
     echo ""
-    warn "即将卸载 TG Mirror，这将删除所有配置和数据"
-    read -p "确认卸载？(y/N): " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        info "已取消"
-        return
-    fi
-
-    # 停止并删除服务
-    systemctl stop $SERVICE_NAME 2>/dev/null || true
-    systemctl disable $SERVICE_NAME 2>/dev/null || true
-    rm -f /etc/systemd/system/$SERVICE_NAME.service
-    systemctl daemon-reload
-
-    # 删除文件
-    rm -rf $INSTALL_DIR
-    rm -f /usr/local/bin/tg-mirror
-
-    info "卸载完成"
+    echo -e "${CYAN}🦊 TG Mirror 管理面板${NC}"
+    echo "========================"
+    echo ""
+    echo "  1) 安装"
+    echo "  2) 更新"
+    echo "  3) 卸载"
+    echo "  4) 查看状态"
+    echo "  5) 查看源频道"
+    echo "  6) 添加源频道"
+    echo "  7) 删除源频道"
+    echo "  8) 修改目标频道"
+    echo "  9) 启停服务"
+    echo " 10) 查看日志"
+    echo "  0) 退出"
+    echo ""
+    echo "========================"
+    read -p "请选择 [0-10]: " choice
+    echo ""
 }
 
 # ===== 入口 =====
 
-case "${1:-}" in
-    ""|install)
-        if [ -f "$CONFIG_FILE" ]; then
-            warn "已安装，使用 tg-mirror 管理"
+# 如果有命令行参数，直接执行
+if [ -n "${1:-}" ]; then
+    case "$1" in
+        install) do_install ;;
+        update|upgrade) do_update ;;
+        uninstall|remove) do_uninstall ;;
+        status) do_status ;;
+        add) 
+            username="${2:-}"
+            if [ -n "$username" ]; then
+                username=${username#@}
+                result=$(add_source "$username")
+                if [ "$result" = "OK" ]; then
+                    info "已添加 @$username"
+                    generate_mirror_script
+                    systemctl restart $SERVICE_NAME
+                    info "服务已重启"
+                elif [ "$result" = "已存在" ]; then
+                    warn "@$username 已在列表中"
+                fi
+            else
+                do_add
+            fi
+            ;;
+        del|delete|rm)
+            username="${2:-}"
+            if [ -n "$username" ]; then
+                username=${username#@}
+                result=$(del_source "$username")
+                if [ "$result" = "OK" ]; then
+                    info "已删除 @$username"
+                    generate_mirror_script
+                    systemctl restart $SERVICE_NAME
+                    info "服务已重启"
+                elif [ "$result" = "未找到" ]; then
+                    err "未找到 @$username"
+                fi
+            else
+                do_del
+            fi
+            ;;
+        target) do_target ;;
+        start) systemctl start $SERVICE_NAME; info "服务已启动" ;;
+        stop) systemctl stop $SERVICE_NAME; info "服务已停止" ;;
+        restart) systemctl restart $SERVICE_NAME; info "服务已重启" ;;
+        log|logs) do_log ;;
+        *)
+            echo "用法: tg-mirror [命令]"
+            echo ""
+            echo "命令: install|update|uninstall|status|add|del|target|start|stop|restart|log"
+            echo ""
+            echo "或直接运行 tg-mirror 进入交互菜单"
+            ;;
+    esac
+    exit 0
+fi
+
+# 无参数，进入交互菜单
+while true; do
+    show_menu
+    case "$choice" in
+        1)
+            if [ -f "$CONFIG_FILE" ]; then
+                warn "已安装，如需重装请先卸载"
+                read -p "按回车返回..." _
+            else
+                do_install
+                read -p "按回车返回..." _
+            fi
+            ;;
+        2)
+            if [ ! -f "$CONFIG_FILE" ]; then
+                err "未安装，请先安装"
+            else
+                do_update
+            fi
+            read -p "按回车返回..." _
+            ;;
+        3)
+            do_uninstall
+            read -p "按回车返回..." _
+            ;;
+        4)
             do_status
-        else
-            do_install
-        fi
-        ;;
-    status)
-        do_status
-        ;;
-    add)
-        do_add "$2"
-        ;;
-    del|delete|rm)
-        do_del "$2"
-        ;;
-    target)
-        do_target "$2"
-        ;;
-    start)
-        systemctl start $SERVICE_NAME
-        info "服务已启动"
-        ;;
-    stop)
-        systemctl stop $SERVICE_NAME
-        info "服务已停止"
-        ;;
-    restart)
-        systemctl restart $SERVICE_NAME
-        info "服务已重启"
-        ;;
-    log|logs)
-        do_log
-        ;;
-    update|upgrade)
-        do_update
-        ;;
-    uninstall|remove)
-        do_uninstall
-        ;;
-    *)
-        echo "用法: tg-mirror [命令]"
-        echo ""
-        echo "命令:"
-        echo "  status        查看状态"
-        echo "  add <user>    添加源频道"
-        echo "  del <user>    删除源频道"
-        echo "  target <user> 修改目标频道"
-        echo "  start         启动服务"
-        echo "  stop          停止服务"
-        echo "  restart       重启服务"
-        echo "  log           查看日志"
-        echo "  update        更新到最新版"
-        echo "  uninstall     卸载"
-        ;;
-esac
+            read -p "按回车返回..." _
+            ;;
+        5)
+            echo ""
+            load_config
+            echo "📡 源频道列表:"
+            echo "$SOURCES"
+            echo ""
+            read -p "按回车返回..." _
+            ;;
+        6)
+            do_add
+            read -p "按回车返回..." _
+            ;;
+        7)
+            do_del
+            read -p "按回车返回..." _
+            ;;
+        8)
+            do_target
+            read -p "按回车返回..." _
+            ;;
+        9)
+            do_service
+            read -p "按回车返回..." _
+            ;;
+        10)
+            do_log
+            ;;
+        0)
+            echo "👋 再见"
+            exit 0
+            ;;
+        *)
+            warn "无效选择"
+            sleep 1
+            ;;
+    esac
+done
