@@ -30,7 +30,7 @@ SOURCE_CHANNELS = [
     "kbjbaX",     # @kbjbaX (KBJba)
 ]
 
-TARGET_CHANNEL = 3588551387  # @hdoebz
+TARGET_CHANNEL = "hdoebz"  # 用 username，兼容不同 session
 
 # 相册收集等待时间（秒），网络延迟大时可调高
 ALBUM_WAIT = 5
