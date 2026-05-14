@@ -67,8 +67,8 @@ client.flood_sleep_threshold = 60
 # 流水线队列
 # 上传队列限制为4：达到4个待上传文件后，下载自动暂停
 MAX_UPLOAD_QUEUE = 4
-# 文件大小上限（字节），超过的跳过不上传
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+# 文件大小上限（字节），超过的裁剪视频内容
+MAX_FILE_SIZE = int(1.5 * 1024 * 1024 * 1024)  # 1.5GB
 download_queue = asyncio.Queue()
 upload_queue = asyncio.Queue(maxsize=MAX_UPLOAD_QUEUE)
 
@@ -90,6 +90,55 @@ def strip_links(text):
     text = re.sub(r'@\S+', '', text)
     text = re.sub(r'\n{3,}', '\n\n', text).strip()
     return text
+
+
+def trim_video_to_size(path, max_size):
+    """裁剪视频使其不超过指定大小，按比例截取前部分"""
+    file_size = os.path.getsize(path)
+    if file_size <= max_size:
+        return True
+
+    # 获取视频总时长
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", path],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return False
+        info = json.loads(result.stdout)
+        duration = float(info.get("format", {}).get("duration", 0))
+        if duration <= 0:
+            return False
+    except Exception:
+        return False
+
+    # 按比例计算应截取的时长（留一点余量）
+    target_duration = duration * (max_size / file_size) * 0.95
+    trimmed_path = path + ".trimsize.mp4"
+
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", path, "-t", str(int(target_duration)),
+             "-c", "copy", "-avoid_negative_ts", "make_zero", trimmed_path],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode == 0 and os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 0:
+            os.replace(trimmed_path, path)
+            new_size = os.path.getsize(path)
+            print(f"[裁剪大小] {file_size/1024/1024:.0f}MB → {new_size/1024/1024:.0f}MB，截取前{int(target_duration)}秒")
+            return True
+        else:
+            print(f"[裁剪大小失败] ffmpeg returncode={result.returncode}")
+            if os.path.exists(trimmed_path):
+                os.remove(trimmed_path)
+            return False
+    except Exception as e:
+        print(f"[裁剪大小异常] {e}")
+        if os.path.exists(trimmed_path):
+            os.remove(trimmed_path)
+        return False
 
 
 def trim_video_start(path, seconds=10):
@@ -200,8 +249,12 @@ async def download_worker():
                     if tmp_path and os.path.exists(tmp_path):
                         os.remove(tmp_path)
                 elif os.path.getsize(tmp_path) > MAX_FILE_SIZE:
-                    print(f"[跳过] msg_id={msg.id} 文件过大({os.path.getsize(tmp_path)/1024/1024/1024:.1f}GB)，超过2GB限制")
-                    os.remove(tmp_path)
+                    print(f"[裁剪] msg_id={msg.id} 文件过大({os.path.getsize(tmp_path)/1024/1024/1024:.1f}GB)，裁剪到1.5GB")
+                    if trim_video_to_size(tmp_path, MAX_FILE_SIZE):
+                        await upload_queue.put(("single", msg, tmp_path))
+                    else:
+                        print(f"[跳过] msg_id={msg.id} 裁剪失败，跳过")
+                        os.remove(tmp_path)
                 else:
                     await upload_queue.put(("single", msg, tmp_path))
             elif task_type == "album":
