@@ -65,8 +65,10 @@ client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 client.flood_sleep_threshold = 60
 
 # 流水线队列
-# 上传队列限制为3：达到3个待上传视频后，下载自动暂停
-MAX_UPLOAD_QUEUE = 3
+# 上传队列限制为4：达到4个待上传文件后，下载自动暂停
+MAX_UPLOAD_QUEUE = 4
+# 文件大小上限（字节），超过的跳过不上传
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 download_queue = asyncio.Queue()
 upload_queue = asyncio.Queue(maxsize=MAX_UPLOAD_QUEUE)
 
@@ -194,6 +196,9 @@ async def download_worker():
                     print(f"[跳过] msg_id={msg.id} 下载失败或空文件")
                     if tmp_path and os.path.exists(tmp_path):
                         os.remove(tmp_path)
+                elif os.path.getsize(tmp_path) > MAX_FILE_SIZE:
+                    print(f"[跳过] msg_id={msg.id} 文件过大({os.path.getsize(tmp_path)/1024/1024/1024:.1f}GB)，超过2GB限制")
+                    os.remove(tmp_path)
                 else:
                     await upload_queue.put(("single", msg, tmp_path))
             elif task_type == "album":
