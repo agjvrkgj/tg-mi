@@ -23,14 +23,19 @@ API_ID = os.environ.get("TG_API_ID", "")
 API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_NAME = "/root/.openclaw/workspace/channel_mirror"
 
-# 源频道列表
-SOURCE_CHANNELS = [
-    2773289819,   # @LYNAE_Ntwork
-    2135749079,   # @ikan_live
-    "kbjbaX",     # @kbjbaX (KBJba)
-]
+# 源频道列表（环境变量用逗号分隔，支持数字ID和用户名）
+_default_sources = "2773289819,2135749079,kbjbaX"
+_raw_sources = os.environ.get("TG_SOURCE_CHANNELS", _default_sources)
+SOURCE_CHANNELS = []
+for s in _raw_sources.split(","):
+    s = s.strip()
+    if s.isdigit():
+        SOURCE_CHANNELS.append(int(s))
+    elif s:
+        SOURCE_CHANNELS.append(s)
 
-TARGET_CHANNEL = "hdoebz"  # 用 username，兼容不同 session
+# 目标频道（支持用户名或数字ID）
+TARGET_CHANNEL = os.environ.get("TG_TARGET_CHANNEL", "hdoebz")
 
 # 相册收集等待时间（秒），网络延迟大时可调高
 ALBUM_WAIT = 5
