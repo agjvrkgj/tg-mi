@@ -24,7 +24,7 @@ API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_mirror")
 
 # 源频道列表（环境变量用逗号分隔，支持数字ID和用户名）
-_default_sources = "kbjba1"
+_default_sources = ""
 _raw_sources = os.environ.get("TG_SOURCE_CHANNELS", _default_sources)
 SOURCE_CHANNELS = []
 for s in _raw_sources.split(","):
@@ -35,7 +35,7 @@ for s in _raw_sources.split(","):
         SOURCE_CHANNELS.append(s)
 
 # 目标频道（支持用户名或数字ID）
-TARGET_CHANNEL = os.environ.get("TG_TARGET_CHANNEL", "hdoebz")
+TARGET_CHANNEL = os.environ.get("TG_TARGET_CHANNEL", "")
 
 # 相册收集等待时间（秒），网络延迟大时可调高
 ALBUM_WAIT = 5
@@ -59,6 +59,14 @@ FILE_MAX_AGE = 7200  # 2小时
 # ===== 检查 =====
 if not API_ID or not API_HASH:
     print("错误：请设置环境变量 TG_API_ID 和 TG_API_HASH")
+    sys.exit(1)
+
+if not TARGET_CHANNEL:
+    print("错误：请设置环境变量 TG_TARGET_CHANNEL")
+    sys.exit(1)
+
+if not SOURCE_CHANNELS:
+    print("错误：请设置环境变量 TG_SOURCE_CHANNELS")
     sys.exit(1)
 
 client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
