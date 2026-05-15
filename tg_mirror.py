@@ -24,7 +24,7 @@ API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "channel_mirror")
 
 # 源频道列表（环境变量用逗号分隔，支持数字ID和用户名）
-_default_sources = "2773289819,2135749079,kbjbaX"
+_default_sources = "kbjba1"
 _raw_sources = os.environ.get("TG_SOURCE_CHANNELS", _default_sources)
 SOURCE_CHANNELS = []
 for s in _raw_sources.split(","):
@@ -65,13 +65,12 @@ client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
 client.flood_sleep_threshold = 60
 
 # 流水线队列
-# 流水线队列（全部串行排队，按顺序搬运）
+# 任务队列（串行处理）
 MAX_FILE_SIZE = int(1.5 * 1024 * 1024 * 1024)  # 1.5GB
-download_queue = asyncio.Queue()
-upload_queue = asyncio.Queue()
+task_queue = asyncio.Queue()
 
 # 上传超时（秒）
-UPLOAD_TIMEOUT = 600  # 10分钟
+UPLOAD_TIMEOUT = 1800  # 30分钟
 
 # 相册缓冲区
 album_buffer = {}
@@ -145,7 +144,8 @@ def trim_video_start(path, seconds=10):
     try:
         result = subprocess.run(
             ["ffmpeg", "-y", "-i", path, "-ss", str(seconds),
-             "-c", "copy", "-avoid_negative_ts", "make_zero", trimmed_path],
+             "-c", "copy", "-avoid_negative_ts", "make_zero",
+             "-movflags", "+faststart", trimmed_path],
             capture_output=True, text=True, timeout=300
         )
         if result.returncode == 0 and os.path.exists(trimmed_path) and os.path.getsize(trimmed_path) > 0:
@@ -232,138 +232,147 @@ def cleanup_old_files():
         print(f"[清理] 删除 {count} 个过期文件")
 
 
-# ===== 流水线 Worker =====
+# ===== 串行 Worker =====
 
-async def download_worker():
-    """下载 worker：从下载队列取任务，下载完放入上传队列"""
+async def refresh_message(msg):
+    """刷新消息的 file reference，防止过期"""
+    try:
+        chat = await msg.get_input_chat()
+        refreshed = await client.get_messages(chat, ids=msg.id)
+        return refreshed if refreshed else msg
+    except Exception:
+        return msg
+
+
+async def process_single(msg):
+    """处理单条消息：下载 → 裁剪 → 上传"""
+    # 刷新 file reference
+    msg = await refresh_message(msg)
+    tmp_path = await msg.download_media(file=DOWNLOAD_DIR)
+
+    if not tmp_path or os.path.getsize(tmp_path) == 0:
+        print(f"[跳过] msg_id={msg.id} 下载失败或空文件")
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return
+
+    # 超过1.5GB裁剪
+    if os.path.getsize(tmp_path) > MAX_FILE_SIZE:
+        print(f"[裁剪] msg_id={msg.id} 文件过大({os.path.getsize(tmp_path)/1024/1024/1024:.1f}GB)，裁剪到1.5GB")
+        if not trim_video_to_size(tmp_path, MAX_FILE_SIZE):
+            print(f"[跳过] msg_id={msg.id} 裁剪失败")
+            os.remove(tmp_path)
+            return
+
+    # 上传
+    thumb_path = None
+    try:
+        if is_video_file(msg):
+            # 确保文件后缀为 .mp4，否则 Telethon 可能当 document 发
+            if not tmp_path.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.webm')):
+                new_path = tmp_path + '.mp4'
+                os.rename(tmp_path, new_path)
+                tmp_path = new_path
+            trim_video_start(tmp_path, seconds=10)
+            duration, width, height, thumb_path = get_video_metadata(tmp_path)
+            attributes = [DocumentAttributeVideo(
+                duration=duration,
+                w=width or 1920,
+                h=height or 1080,
+                supports_streaming=True,
+            )]
+            await asyncio.wait_for(client.send_file(
+                TARGET_CHANNEL,
+                file=tmp_path,
+                caption=strip_links(msg.text),
+                thumb=thumb_path,
+                attributes=attributes,
+                force_document=False,
+                mime_type='video/mp4',
+            ), timeout=UPLOAD_TIMEOUT)
+        else:
+            await asyncio.wait_for(client.send_file(
+                TARGET_CHANNEL,
+                file=tmp_path,
+                caption=strip_links(msg.text),
+            ), timeout=UPLOAD_TIMEOUT)
+        print(f"[搬运成功] msg_id={msg.id}")
+    except asyncio.TimeoutError:
+        print(f"[搬运超时] msg_id={msg.id} 上传超过{UPLOAD_TIMEOUT}秒，跳过")
+    except Exception as e:
+        print(f"[搬运失败] msg_id={msg.id} error={e}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        if thumb_path and os.path.exists(thumb_path):
+            os.remove(thumb_path)
+
+
+async def process_album(messages):
+    """处理相册：下载全部 → 处理视频 → 一次性发送相册"""
+    tmp_files = []
+    caption = ""
+    for m in messages:
+        if m.text:
+            caption = m.text
+            break
+    for m in messages:
+        m = await refresh_message(m)
+        tmp_path = await m.download_media(file=DOWNLOAD_DIR)
+        if not tmp_path or os.path.getsize(tmp_path) == 0:
+            print(f"[album] msg_id={m.id} 下载失败或空文件")
+            if tmp_path:
+                os.remove(tmp_path)
+            continue
+        print(f"[album] msg_id={m.id} 下载完成: {os.path.basename(tmp_path)} ({os.path.getsize(tmp_path)/1024/1024:.1f}MB) video={is_video_file(m)}")
+        if is_video_file(m):
+            # 确保视频后缀正确，Telethon 会根据后缀推断属性
+            if not tmp_path.lower().endswith(('.mp4', '.mov', '.mkv', '.avi', '.webm')):
+                new_path = tmp_path + '.mp4'
+                os.rename(tmp_path, new_path)
+                tmp_path = new_path
+            trim_video_start(tmp_path, seconds=10)
+            if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                print(f"[album] msg_id={m.id} 裁剪后文件不存在或为空，跳过")
+                continue
+        tmp_files.append(tmp_path)
+
+    if not tmp_files:
+        print(f"[跳过] album 全部下载失败")
+        return
+
+    try:
+        await asyncio.wait_for(client.send_file(
+            TARGET_CHANNEL,
+            file=tmp_files,
+            caption=strip_links(caption),
+            force_document=False,
+            supports_streaming=True,
+        ), timeout=UPLOAD_TIMEOUT)
+        print(f"[搬运成功] album 共{len(tmp_files)}个媒体")
+    except asyncio.TimeoutError:
+        print(f"[搬运超时] album 上传超过{UPLOAD_TIMEOUT}秒，跳过")
+    except Exception as e:
+        print(f"[搬运失败] album error={e}")
+    finally:
+        for f in tmp_files:
+            if os.path.exists(f):
+                os.remove(f)
+
+
+async def serial_worker():
+    """串行 worker：一个一个处理，下载完立刻上传，再处理下一个"""
     while True:
-        task_type, data = await download_queue.get()
+        task_type, data = await task_queue.get()
         try:
             if task_type == "single":
-                msg = data
-                tmp_path = await msg.download_media(file=DOWNLOAD_DIR)
-                if not tmp_path or os.path.getsize(tmp_path) == 0:
-                    print(f"[跳过] msg_id={msg.id} 下载失败或空文件")
-                    if tmp_path and os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                elif os.path.getsize(tmp_path) > MAX_FILE_SIZE:
-                    print(f"[裁剪] msg_id={msg.id} 文件过大({os.path.getsize(tmp_path)/1024/1024/1024:.1f}GB)，裁剪到1.5GB")
-                    if trim_video_to_size(tmp_path, MAX_FILE_SIZE):
-                        await upload_queue.put(("single", msg, tmp_path))
-                    else:
-                        print(f"[跳过] msg_id={msg.id} 裁剪失败，跳过")
-                        os.remove(tmp_path)
-                else:
-                    await upload_queue.put(("single", msg, tmp_path))
+                await process_single(data)
             elif task_type == "album":
-                messages = data
-                tmp_files = []
-                caption = ""
-                for m in messages:
-                    if m.text:
-                        caption = m.text
-                        break
-                for m in messages:
-                    tmp_path = await m.download_media(file=DOWNLOAD_DIR)
-                    if tmp_path and os.path.getsize(tmp_path) > 0:
-                        tmp_files.append(tmp_path)
-                    elif tmp_path:
-                        os.remove(tmp_path)
-                if tmp_files:
-                    await upload_queue.put(("album", caption, tmp_files))
-                else:
-                    print(f"[跳过] album 全部下载失败")
+                await process_album(data)
         except Exception as e:
-            print(f"[下载错误] {e}")
+            print(f"[处理错误] {e}")
         finally:
-            download_queue.task_done()
-
-
-async def upload_worker():
-    """上传 worker：从上传队列取任务，上传到目标频道"""
-    while True:
-        item = await upload_queue.get()
-        try:
-            if item[0] == "single":
-                _, msg, tmp_path = item
-                thumb_path = None
-                try:
-                    if is_video_file(msg):
-                        # 裁掉开头10秒
-                        trim_video_start(tmp_path, seconds=10)
-                        duration, width, height, thumb_path = get_video_metadata(tmp_path)
-                        attributes = [DocumentAttributeVideo(
-                            duration=duration,
-                            w=width or 1920,
-                            h=height or 1080,
-                            supports_streaming=True,
-                        )]
-                        await asyncio.wait_for(client.send_file(
-                            TARGET_CHANNEL,
-                            file=tmp_path,
-                            caption=strip_links(msg.text),
-                            thumb=thumb_path,
-                            attributes=attributes,
-                            force_document=False,
-                        ), timeout=UPLOAD_TIMEOUT)
-                    else:
-                        await asyncio.wait_for(client.send_file(
-                            TARGET_CHANNEL,
-                            file=tmp_path,
-                            caption=strip_links(msg.text),
-                        ), timeout=UPLOAD_TIMEOUT)
-                    print(f"[搬运成功] msg_id={msg.id}")
-                except asyncio.TimeoutError:
-                    print(f"[搬运超时] msg_id={msg.id} 上传超过{UPLOAD_TIMEOUT}秒，跳过")
-                except Exception as e:
-                    print(f"[搬运失败] msg_id={msg.id} error={e}")
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                    if thumb_path and os.path.exists(thumb_path):
-                        os.remove(thumb_path)
-
-            elif item[0] == "album":
-                _, caption, tmp_files = item
-                try:
-                    # 分组：视频和图片分开发，同类型才能组成 media group
-                    video_files = [f for f in tmp_files if f.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.webm'))]
-                    image_files = [f for f in tmp_files if f not in video_files]
-
-                    # 如果全是同一类型，直接一组发
-                    if not video_files or not image_files:
-                        await asyncio.wait_for(client.send_file(
-                            TARGET_CHANNEL,
-                            file=tmp_files,
-                            caption=strip_links(caption),
-                        ), timeout=UPLOAD_TIMEOUT)
-                    else:
-                        # 混合类型：先发图片组，再发视频组
-                        if image_files:
-                            await asyncio.wait_for(client.send_file(
-                                TARGET_CHANNEL,
-                                file=image_files,
-                                caption=strip_links(caption),
-                            ), timeout=UPLOAD_TIMEOUT)
-                        if video_files:
-                            await asyncio.wait_for(client.send_file(
-                                TARGET_CHANNEL,
-                                file=video_files,
-                                caption="" if image_files else strip_links(caption),
-                            ), timeout=UPLOAD_TIMEOUT)
-                    print(f"[搬运成功] album 共{len(tmp_files)}个媒体")
-                except asyncio.TimeoutError:
-                    print(f"[搬运超时] album 上传超过{UPLOAD_TIMEOUT}秒，跳过")
-                except Exception as e:
-                    print(f"[搬运失败] album error={e}")
-                finally:
-                    for f in tmp_files:
-                        if os.path.exists(f):
-                            os.remove(f)
-        except Exception as e:
-            print(f"[上传错误] {e}")
-        finally:
-            upload_queue.task_done()
+            task_queue.task_done()
 
 
 async def cleanup_worker():
@@ -381,7 +390,7 @@ async def collect_album(grouped_id):
     data = album_buffer.pop(grouped_id, None)
     if not data:
         return
-    await download_queue.put(("album", data["messages"]))
+    await task_queue.put(("album", data["messages"]))
 
 
 @client.on(events.NewMessage(chats=SOURCE_CHANNELS))
@@ -403,8 +412,8 @@ async def handler(event):
         album_buffer[gid]["task"] = asyncio.ensure_future(collect_album(gid))
         return
 
-    # 单条消息加入下载队列
-    await download_queue.put(("single", msg))
+    # 单条消息加入队列
+    await task_queue.put(("single", msg))
 
 
 # ===== 启动 =====
@@ -418,11 +427,10 @@ async def main():
     print(f"已登录: {me.first_name} (@{me.username})")
     print(f"监控: {SOURCE_CHANNELS} → {TARGET_CHANNEL}")
     print(f"下载目录: {DOWNLOAD_DIR}")
-    print("运行中（流水线模式）...")
+    print("运行中（串行模式）...")
 
     # 启动 worker
-    asyncio.ensure_future(download_worker())
-    asyncio.ensure_future(upload_worker())
+    asyncio.ensure_future(serial_worker())
     asyncio.ensure_future(cleanup_worker())
 
     await client.run_until_disconnected()
