@@ -814,8 +814,8 @@ def start_admin_server() -> None:
     server = ThreadingHTTPServer((settings.admin_host, settings.admin_port), AdminHandler)
     thread = Thread(target=server.serve_forever, name="tg-mirror-admin", daemon=True)
     thread.start()
-    token_hint = f"?token={settings.admin_token}" if settings.admin_token else ""
-    log(f"管理后台已启动: http://{settings.admin_host}:{settings.admin_port}/{token_hint}")
+    auth_hint = "（已启用 token 保护）" if settings.admin_token else "（未设置 token，仅建议本机访问）"
+    log(f"管理后台已启动: http://{settings.admin_host}:{settings.admin_port}/ {auth_hint}")
 
 
 async def main() -> None:

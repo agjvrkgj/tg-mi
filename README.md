@@ -101,6 +101,8 @@ TG_ADMIN_TOKEN=change_me_to_a_long_random_string
 http://127.0.0.1:8080/?token=change_me_to_a_long_random_string
 ```
 
+脚本启动日志不会打印 token 明文；如果把后台暴露到公网，请务必设置强随机 `TG_ADMIN_TOKEN`，并优先放在反向代理或防火墙之后。
+
 如果需要关闭后台：
 
 ```env
