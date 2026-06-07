@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, functions, types, utils
 from telethon.tl.custom.message import Message
 from telethon.tl.types import DocumentAttributeVideo
 
@@ -69,6 +69,7 @@ class Settings:
     album_wait: float
     upload_timeout: int
     trim_video_seconds: int
+    thumbnail_second: int
     include_photos: bool
     strip_links: bool
 
@@ -111,6 +112,7 @@ class Settings:
             album_wait=float(os.getenv("TG_ALBUM_WAIT", "3")),
             upload_timeout=int(os.getenv("TG_UPLOAD_TIMEOUT", "1800")),
             trim_video_seconds=int(os.getenv("TG_TRIM_VIDEO_SECONDS", "10")),
+            thumbnail_second=int(os.getenv("TG_THUMBNAIL_SECOND", "5")),
             include_photos=env_bool("TG_INCLUDE_PHOTOS", False),
             strip_links=env_bool("TG_STRIP_LINKS", True),
         )
@@ -124,6 +126,14 @@ client.flood_sleep_threshold = 60
 
 task_queue: asyncio.Queue[tuple[str, Message | list[Message]]] = asyncio.Queue()
 album_buffer: dict[int, dict[str, object]] = {}
+
+
+@dataclass
+class PreparedMedia:
+    path: Path
+    is_video: bool
+    thumb_path: Path | None = None
+    attributes: list[DocumentAttributeVideo] | None = None
 
 
 def log(message: str) -> None:
@@ -206,7 +216,7 @@ def video_duration(path: Path) -> int:
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError):
         return 0
 
-def video_metadata(path: Path) -> tuple[int, int, int, Path | None]:
+def video_metadata(path: Path, thumbnail_second: int = 5) -> tuple[int, int, int, Path | None]:
     """Return duration, width, height and thumbnail path when ffmpeg is available."""
     if not ffmpeg_exists():
         return 0, 0, 0, None
@@ -242,7 +252,10 @@ def video_metadata(path: Path) -> tuple[int, int, int, Path | None]:
                     height = int(stream.get("height", 0) or 0)
                     break
 
-        seek_second = max(1, min(duration // 3 if duration else 1, 10))
+        if duration > 1:
+            seek_second = max(0, min(thumbnail_second, duration - 1))
+        else:
+            seek_second = max(0, thumbnail_second)
         subprocess.run(
             [
                 "ffmpeg",
@@ -342,6 +355,26 @@ def trim_video_start(path: Path, seconds: int) -> bool:
         return False
 
 
+def prepare_video(path: Path) -> PreparedMedia | None:
+    path = ensure_video_suffix(path)
+    if not trim_video_start(path, settings.trim_video_seconds):
+        remove_file(path)
+        return None
+
+    duration, width, height, thumb_path = video_metadata(path, settings.thumbnail_second)
+    attributes = [
+        DocumentAttributeVideo(
+            duration=duration,
+            w=width or 1280,
+            h=height or 720,
+            supports_streaming=True,
+        )
+    ]
+    if thumb_path:
+        log(f"已选取裁剪后视频第 {settings.thumbnail_second}s 画面作为封面: {path.name}")
+    return PreparedMedia(path=path, is_video=True, thumb_path=thumb_path, attributes=attributes)
+
+
 async def refresh_message(message: Message) -> Message:
     try:
         chat = await message.get_input_chat()
@@ -373,26 +406,19 @@ async def send_single(message: Message) -> None:
     thumb_path: Path | None = None
     try:
         if is_video_message(message):
-            path = ensure_video_suffix(path)
-            if not trim_video_start(path, settings.trim_video_seconds):
+            prepared = prepare_video(path)
+            if not prepared:
                 log(f"跳过 msg_id={message.id}: 视频裁剪失败，避免上传未裁剪视频")
                 return
-            duration, width, height, thumb_path = video_metadata(path)
-            attributes = [
-                DocumentAttributeVideo(
-                    duration=duration,
-                    w=width or 1280,
-                    h=height or 720,
-                    supports_streaming=True,
-                )
-            ]
+            path = prepared.path
+            thumb_path = prepared.thumb_path
             await asyncio.wait_for(
                 client.send_file(
                     settings.target_channel,
-                    file=str(path),
+                    file=str(prepared.path),
                     caption=clean_caption(message.text),
-                    thumb=str(thumb_path) if thumb_path else None,
-                    attributes=attributes,
+                    thumb=str(prepared.thumb_path) if prepared.thumb_path else None,
+                    attributes=prepared.attributes,
                     force_document=False,
                     supports_streaming=True,
                 ),
@@ -418,6 +444,44 @@ async def send_single(message: Message) -> None:
         remove_file(thumb_path)
 
 
+async def send_prepared_album(media_items: list[PreparedMedia], caption: str) -> None:
+    """Send an album with per-video thumbnails while keeping video/photo/text grouped."""
+    entity = await client.get_input_entity(settings.target_channel)
+    multi_media = []
+    cleaned_caption = clean_caption(caption)
+
+    for index, item in enumerate(media_items):
+        file_to_media_kwargs = {
+            "force_document": False,
+            "supports_streaming": True,
+        }
+        if item.is_video:
+            file_to_media_kwargs.update(
+                {
+                    "attributes": item.attributes,
+                    "thumb": str(item.thumb_path) if item.thumb_path else None,
+                    "nosound_video": True,
+                }
+            )
+
+        _, input_media, _ = await client._file_to_media(str(item.path), **file_to_media_kwargs)
+        if isinstance(input_media, (types.InputMediaUploadedPhoto, types.InputMediaPhotoExternal)):
+            uploaded = await client(functions.messages.UploadMediaRequest(entity, media=input_media))
+            input_media = utils.get_input_media(uploaded.photo)
+        elif isinstance(input_media, (types.InputMediaUploadedDocument, types.InputMediaDocumentExternal)):
+            uploaded = await client(functions.messages.UploadMediaRequest(entity, media=input_media))
+            input_media = utils.get_input_media(uploaded.document, supports_streaming=True)
+
+        multi_media.append(
+            types.InputSingleMedia(
+                input_media,
+                message=cleaned_caption if index == 0 else "",
+            )
+        )
+
+    await client(functions.messages.SendMultiMediaRequest(entity, multi_media=multi_media))
+
+
 async def send_album(messages: Iterable[Message]) -> None:
     album_messages = [message for message in messages if is_album_media(message)]
     has_video = any(is_video_message(message) for message in album_messages)
@@ -427,7 +491,7 @@ async def send_album(messages: Iterable[Message]) -> None:
     # 相册里只要有视频，就把同组图片也一起发送，保持“视频+图片+文字”一条消息。
     selected = album_messages if has_video else [message for message in album_messages if is_photo_message(message)]
 
-    files: list[Path] = []
+    prepared_files: list[PreparedMedia] = []
     caption = next((message.text for message in selected if message.text), "")
     try:
         for message in selected:
@@ -435,36 +499,33 @@ async def send_album(messages: Iterable[Message]) -> None:
             if path is None:
                 log(f"相册跳过 msg_id={message.id}: 下载失败或空文件")
                 continue
-            if is_video_message(message):
-                path = ensure_video_suffix(path)
-                if not trim_video_start(path, settings.trim_video_seconds):
-                    log(f"相册跳过: msg_id={message.id} 视频裁剪失败，避免发送不完整或未裁剪相册")
-                    remove_file(path)
-                    return
-            files.append(path)
 
-        if not files:
+            if is_video_message(message):
+                prepared = prepare_video(path)
+                if not prepared:
+                    log(f"相册跳过: msg_id={message.id} 视频裁剪失败，避免发送不完整或未裁剪相册")
+                    return
+                prepared_files.append(prepared)
+            else:
+                prepared_files.append(PreparedMedia(path=path, is_video=False))
+
+        if not prepared_files:
             log("相册跳过: 没有成功下载的媒体")
             return
 
         await asyncio.wait_for(
-            client.send_file(
-                settings.target_channel,
-                file=[str(path) for path in files],
-                caption=clean_caption(caption),
-                force_document=False,
-                supports_streaming=True,
-            ),
+            send_prepared_album(prepared_files, caption),
             timeout=settings.upload_timeout,
         )
-        log(f"搬运成功 album count={len(files)}")
+        log(f"搬运成功 album count={len(prepared_files)}")
     except asyncio.TimeoutError:
         log(f"相册搬运超时: 超过 {settings.upload_timeout}s")
     except Exception as exc:
         log(f"相册搬运失败: {exc}")
     finally:
-        for path in files:
-            remove_file(path)
+        for prepared in prepared_files:
+            remove_file(prepared.path)
+            remove_file(prepared.thumb_path)
 
 
 async def worker() -> None:
@@ -534,6 +595,7 @@ async def main() -> None:
     log(f"下载目录: {settings.download_dir}")
     log(f"搬运图片: {'是' if settings.include_photos else '否；但含视频的相册会保留同组图片'}")
     log(f"视频上传前删除开头: {settings.trim_video_seconds}s")
+    log(f"视频封面截取时间: 裁剪后第 {settings.thumbnail_second}s")
     if not ffmpeg_exists():
         log("提示: 未检测到 ffmpeg/ffprobe，将不生成视频缩略图和精确元数据")
 
